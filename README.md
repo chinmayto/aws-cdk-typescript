@@ -6,8 +6,8 @@ This project deploys a scalable website infrastructure on AWS using CDK in TypeS
 
 - VPC with public and private subnets across 2 availability zones
 - Application Load Balancer (ALB) in public subnets
-- Auto Scaling Group with EC2 instances in private subnets
-- Bastion host for SSH access
+- 2 EC2 instances (Amazon Linux 2023) in private subnets, one per AZ
+- IMDSv2 enabled for enhanced security
 - Security groups for network isolation
 
 ## Prerequisites

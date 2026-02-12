@@ -1,7 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as elbv2_targets from 'aws-cdk-lib/aws-elasticloadbalancingv2-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
@@ -59,12 +59,6 @@ export class WebsiteStack extends cdk.Stack {
       'Allow HTTP traffic from ALB'
     );
 
-    ec2SecurityGroup.addIngressRule(
-      ec2.Peer.ipv4(vpc.vpcCidrBlock),
-      ec2.Port.tcp(22),
-      'Allow SSH from VPC'
-    );
-
     // IAM role for EC2 instances
     const ec2Role = new iam.Role(this, 'EC2Role', {
       assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
@@ -73,39 +67,59 @@ export class WebsiteStack extends cdk.Stack {
       ]
     });
 
-    // User data script to install and configure web server
+    // User data script to install and configure web server with IMDSv2
     const userData = ec2.UserData.forLinux();
     userData.addCommands(
       'yum update -y',
       'yum install -y httpd',
       'systemctl start httpd',
       'systemctl enable httpd',
-      'echo \'<h1>Hello from AWS CDK!</h1>\' > /var/www/html/index.html',
-      'echo \'<p>This website is running on EC2 in a private subnet</p>\' >> /var/www/html/index.html',
-      'echo \'<p>Instance ID: \' $(curl -s http://169.254.169.254/latest/meta-data/instance-id) \'</p>\' >> /var/www/html/index.html'
+      'TOKEN=$(curl --request PUT "http://169.254.169.254/latest/api/token" --header "X-aws-ec2-metadata-token-ttl-seconds: 3600")',
+      'instanceId=$(curl -s http://169.254.169.254/latest/meta-data/instance-id --header "X-aws-ec2-metadata-token: $TOKEN")',
+      'instanceAZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone --header "X-aws-ec2-metadata-token: $TOKEN")',
+      'privHostName=$(curl -s http://169.254.169.254/latest/meta-data/local-hostname --header "X-aws-ec2-metadata-token: $TOKEN")',
+      'privIPv4=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 --header "X-aws-ec2-metadata-token: $TOKEN")',
+      'echo "<font face = \\"Verdana\\" size = \\"5\\">"                               > /var/www/html/index.html',
+      'echo "<center><h1>AWS Linux VM Deployed with CDK using TypeScript</h1></center>"   >> /var/www/html/index.html',
+      'echo "<center> <b>EC2 Instance Metadata</b> </center>"                  >> /var/www/html/index.html',
+      'echo "<center> <b>Instance ID:</b> $instanceId </center>"               >> /var/www/html/index.html',
+      'echo "<center> <b>AWS Availablity Zone:</b> $instanceAZ </center>"      >> /var/www/html/index.html',
+      'echo "<center> <b>Private Hostname:</b> $privHostName </center>"        >> /var/www/html/index.html',
+      'echo "<center> <b>Private IPv4:</b> $privIPv4 </center>"                >> /var/www/html/index.html',
+      'echo "</font>"                                                          >> /var/www/html/index.html'
     );
 
-    // Launch template for Auto Scaling Group
-    const launchTemplate = new ec2.LaunchTemplate(this, 'WebsiteLaunchTemplate', {
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
-      machineImage: new ec2.AmazonLinuxImage({
-        generation: ec2.AmazonLinuxGeneration.AMAZON_LINUX_2
-      }),
-      securityGroup: ec2SecurityGroup,
-      role: ec2Role,
-      userData: userData
+    // Get the private subnets for the two AZs
+    const privateSubnets = vpc.selectSubnets({
+      subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS
     });
 
-    // Auto Scaling Group
-    const asg = new autoscaling.AutoScalingGroup(this, 'WebsiteASG', {
+    // Create EC2 instance in first AZ
+    const instance1 = new ec2.Instance(this, 'WebInstance1', {
       vpc: vpc,
-      launchTemplate: launchTemplate,
-      minCapacity: 1,
-      maxCapacity: 3,
-      desiredCapacity: 2,
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+      machineImage: ec2.MachineImage.latestAmazonLinux2023(),
+      securityGroup: ec2SecurityGroup,
+      role: ec2Role,
+      userData: userData,
       vpcSubnets: {
-        subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS
-      }
+        subnets: [privateSubnets.subnets[0]]
+      },
+      requireImdsv2: true
+    });
+
+    // Create EC2 instance in second AZ
+    const instance2 = new ec2.Instance(this, 'WebInstance2', {
+      vpc: vpc,
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+      machineImage: ec2.MachineImage.latestAmazonLinux2023(),
+      securityGroup: ec2SecurityGroup,
+      role: ec2Role,
+      userData: userData,
+      vpcSubnets: {
+        subnets: [privateSubnets.subnets[1]]
+      },
+      requireImdsv2: true
     });
 
     // Application Load Balancer
@@ -123,14 +137,15 @@ export class WebsiteStack extends cdk.Stack {
       vpc: vpc,
       port: 80,
       protocol: elbv2.ApplicationProtocol.HTTP,
+      targets: [
+        new elbv2_targets.InstanceTarget(instance1, 80),
+        new elbv2_targets.InstanceTarget(instance2, 80)
+      ],
       healthCheck: {
         path: '/',
         interval: cdk.Duration.seconds(30)
       }
     });
-
-    // Add the Auto Scaling Group to the target group
-    targetGroup.addTarget(asg);
 
     // Listener
     alb.addListener('WebsiteListener', {
@@ -139,23 +154,20 @@ export class WebsiteStack extends cdk.Stack {
       defaultTargetGroups: [targetGroup]
     });
 
-    // Bastion host for SSH access to private instances
-    const bastionHost = new ec2.BastionHostLinux(this, 'BastionHost', {
-      vpc: vpc,
-      subnetSelection: {
-        subnetType: ec2.SubnetType.PUBLIC
-      }
-    });
-
     // Outputs
     new cdk.CfnOutput(this, 'LoadBalancerDNS', {
       value: alb.loadBalancerDnsName,
       description: 'DNS name of the load balancer'
     });
 
-    new cdk.CfnOutput(this, 'BastionHostId', {
-      value: bastionHost.instanceId,
-      description: 'Instance ID of the bastion host'
+    new cdk.CfnOutput(this, 'Instance1Id', {
+      value: instance1.instanceId,
+      description: 'Instance ID of the first EC2 instance'
+    });
+
+    new cdk.CfnOutput(this, 'Instance2Id', {
+      value: instance2.instanceId,
+      description: 'Instance ID of the second EC2 instance'
     });
 
     new cdk.CfnOutput(this, 'VPCId', {
